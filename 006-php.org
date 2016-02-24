@@ -1,4 +1,4 @@
-#+title: php: stack overflow when decompressing tar archives
+#+title: php: stack overflow when decompressing tar archives (CVE-2016-2554)
 #+author: Hans Jerry Illikainen
 #+email: hji@dyntopia.com
 
@@ -333,9 +333,12 @@ if __name__ == "__main__":
 
 * Solution
 
-Update to php 5.5.32, 5.6.18 or 7.0.3.
+This issue has been assigned CVE-2016-2554 [2] and it has been fixed in
+version 5.5.32, 5.6.18 and 7.0.3.
 
 
 * Footnotes
 
 [1] https://bugs.php.net/bug.php?id=71488
+
+[2] http://seclists.org/oss-sec/2016/q1/428
