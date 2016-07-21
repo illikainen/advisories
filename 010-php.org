@@ -1,3 +1,7 @@
+#+title: CVE-2016-4473: php: invalid free in phar_extract_file()
+#+author: Hans Jerry Illikainen
+#+email: hji@dyntopia.com
+
 An invalid free (assigned CVE-2016-4473) may occur under certain
 conditions when processing phar-compatible archives in php 5.6.22, 7.0.7
 and git head:
